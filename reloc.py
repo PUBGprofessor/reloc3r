@@ -85,16 +85,33 @@ def load_netvlad_h5(path):
     group with a 'global_descriptor' dataset. Returns (names, descs) where
     descs has shape (N, 4096) and is L2-normalized float32.
     """
-    names = sorted(k for k in h5py.File(path, 'r').keys())
-    descs = []
     with h5py.File(path, 'r') as f:
-        for name in names:
-            descs.append(np.asarray(f[name]['global_descriptor'], dtype=np.float32))
+        descriptors = {}
+
+        def collect_descriptors(name, item):
+            if isinstance(item, h5py.Group) and 'global_descriptor' in item:
+                descriptors[name] = np.asarray(item['global_descriptor'], dtype=np.float32)
+
+        # HLoc may store image names with directory prefixes (e.g. db/1003.jpg),
+        # which appear as nested groups in HDF5 rather than top-level keys.
+        f.visititems(collect_descriptors)
+
+    names = sorted(descriptors)
+    descs = [descriptors[name] for name in names]
     descs = np.stack(descs, axis=0) if descs else np.zeros((0, 4096), dtype=np.float32)
     norms = np.linalg.norm(descs, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     descs = descs / norms
     return names, descs
+
+
+def resolve_image_path(dataset_dir, images_dir, image_name):
+    """Resolve both flat image names and names containing subdirectory prefixes."""
+    candidates = [os.path.join(images_dir, image_name), os.path.join(dataset_dir, image_name)]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return candidates[0]
 
 
 def rotation_error_deg(R_est, R_gt):
@@ -141,9 +158,11 @@ def main():
     # ---- NetVLAD descriptors -------------------------------------------
     print('Loading NetVLAD global descriptors...')
     db_names, db_descs_all = load_netvlad_h5(
-        os.path.join(args.map_dir, 'hloc_outputs', 'global-feats-netvlad.h5'))
+        # os.path.join(args.map_dir, 'hloc_outputs', 'global-feats-netvlad.h5'))
+        os.path.join(args.map_dir, 'hloc_outputs', 'global-feats-megaloc.h5'))
     q_names, q_descs = load_netvlad_h5(
-        os.path.join(args.query_dir, 'hloc_outputs', 'global-feats-netvlad.h5'))
+        # os.path.join(args.query_dir, 'hloc_outputs', 'global-feats-netvlad.h5'))
+        os.path.join(args.query_dir, 'hloc_outputs', 'global-feats-megaloc.h5'))
     print('  db descriptors: {}, query descriptors: {}'.format(len(db_names), len(q_names)))
 
     # keep only db images that also have a pose and a descriptor
@@ -177,7 +196,7 @@ def main():
         if q_name not in query_gt:
             print('  skip {} (no GT pose)'.format(q_name))
             continue
-        q_path = os.path.join(query_images_dir, q_name)
+        q_path = resolve_image_path(args.query_dir, query_images_dir, q_name)
         if not os.path.exists(q_path):
             print('  skip {} (no image file)'.format(q_name))
             continue
@@ -193,7 +212,7 @@ def main():
         poses_db_c2w = []
         poses_q2d = []
         for db_name in top_names:
-            db_path = os.path.join(map_images_dir, db_name)
+            db_path = resolve_image_path(args.map_dir, map_images_dir, db_name)
             if not os.path.exists(db_path):
                 continue
             db_img = to_device(get_image(db_path))
