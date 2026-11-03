@@ -134,6 +134,10 @@ def main():
     parser.add_argument('--img_reso', type=str, default='512', choices=['224', '512'])
     parser.add_argument('--topk', type=int, default=5,
                         help='number of db images per query for motion averaging')
+    parser.add_argument('--query_image', type=str, default=None,
+                        help='localize only this query image name (as stored in COLMAP/H5)')
+    parser.add_argument('--pose_details', action='store_true',
+                        help='save per-query relative poses and final pose under output_dir/pose_details')
     parser.add_argument('--amp', type=int, default=0, choices=[0, 1],
                         help='use Automatic Mixed Precision (fp16)')
     args = parser.parse_args()
@@ -164,6 +168,9 @@ def main():
         # os.path.join(args.query_dir, 'hloc_outputs', 'global-feats-netvlad.h5'))
         os.path.join(args.query_dir, 'hloc_outputs', 'global-feats-megaloc.h5'))
     print('  db descriptors: {}, query descriptors: {}'.format(len(db_names), len(q_names)))
+
+    if args.query_image is not None and args.query_image not in q_names:
+        raise ValueError('Query image {!r} was not found in the query descriptors.'.format(args.query_image))
 
     # keep only db images that also have a pose and a descriptor
     keep = [i for i, n in enumerate(db_names) if n in map_gt]
@@ -201,8 +208,10 @@ def main():
 
     # ---- localize every query ------------------------------------------
     results = []
-    for qi, q_name in enumerate(tqdm(q_names, desc='Localizing')):
-        if q_name not in query_gt:
+    query_items = [(qi, name) for qi, name in enumerate(q_names)
+                   if args.query_image is None or name == args.query_image]
+    for qi, q_name in tqdm(query_items, desc='Localizing'):
+        if q_name not in query_gt and args.query_image is None:
             print('  skip {} (no GT pose)'.format(q_name))
             continue
         q_path = resolve_image_path(args.query_dir, query_images_dir, q_name)
@@ -220,7 +229,9 @@ def main():
         # 2) relative poses + 3) motion averaging (ray intersection)
         poses_db_c2w = []
         poses_q2d = []
-        for db_name in top_names:
+        pair_details = []
+        for db_idx in order:
+            db_name = db_names[db_idx]
             db_path = resolve_image_path(args.map_dir, map_images_dir, db_name)
             if not os.path.exists(db_path):
                 continue
@@ -238,6 +249,7 @@ def main():
 
             poses_db_c2w.append(np.linalg.inv(map_gt[db_name]))
             poses_q2d.append(pose_q2d)
+            pair_details.append((db_name, float(sims[db_idx]), pose_q2d.copy()))
 
         if len(poses_db_c2w) < 2:
             print('  skip {} (not enough valid db pairs)'.format(q_name))
@@ -248,29 +260,56 @@ def main():
         query_w2c = np.linalg.inv(query_c2w)
 
         results.append(dict(name=q_name, w2c=query_w2c, c2w=query_c2w,
-                            top_names=top_names, top_sims=sims[order]))
+                            top_names=top_names, top_sims=sims[order],
+                            pair_details=pair_details))
+
+        if args.query_image is not None:
+            print('\nQuery image:', q_name)
+            print('Estimated pose (camera-to-world):\n', query_c2w)
+            print('Estimated pose (world-to-camera):\n', query_w2c)
+
+        if args.pose_details:
+            details_dir = os.path.join(args.output_dir, 'pose_details')
+            os.makedirs(details_dir, exist_ok=True)
+            details_name = q_name.replace('\\', '_').replace('/', '_')
+            details_path = os.path.join(details_dir, details_name + '.txt')
+            with open(details_path, 'w') as f:
+                f.write('Query image: {}\n'.format(q_name))
+                f.write('Relative poses (query-to-database; translation direction normalized):\n')
+                for db_name, similarity, relative_pose in pair_details:
+                    f.write('\nDatabase image: {}\n'.format(db_name))
+                    f.write('Retrieval similarity: {:.9f}\n'.format(similarity))
+                    f.write('{}\n'.format(np.array2string(relative_pose, precision=9)))
+                f.write('\nFinal camera-to-world pose:\n')
+                f.write('{}\n'.format(np.array2string(query_c2w, precision=9)))
+                f.write('\nFinal world-to-camera pose:\n')
+                f.write('{}\n'.format(np.array2string(query_w2c, precision=9)))
+            print('Pose details saved to {}'.format(details_path))
 
     if len(results) == 0:
         print('No query localized, aborting.')
         return
 
     # ---- save estimated poses (w2c, COLMAP style) -----------------------
-    pose_path = os.path.join(args.output_dir, 'query_poses.txt')
-    with open(pose_path, 'w') as f:
-        f.write('# Estimated query poses (world-to-camera, COLMAP convention)\n')
-        f.write('# name QW QX QY QZ TX TY TZ\n')
-        for r in results:
-            T = r['w2c']
-            qx, qy, qz, qw = R.from_matrix(T[:3, :3]).as_quat()
-            tx, ty, tz = T[:3, 3]
-            f.write('{} {:.9f} {:.9f} {:.9f} {:.9f} {:.9f} {:.9f} {:.9f}\n'.format(
-                r['name'], qw, qx, qy, qz, tx, ty, tz))
-    print('Poses saved to {}'.format(pose_path))
+    if args.query_image is None:
+        pose_path = os.path.join(args.output_dir, 'query_poses.txt')
+        with open(pose_path, 'w') as f:
+            f.write('# Estimated query poses (world-to-camera, COLMAP convention)\n')
+            f.write('# name QW QX QY QZ TX TY TZ\n')
+            for r in results:
+                T = r['w2c']
+                qx, qy, qz, qw = R.from_matrix(T[:3, :3]).as_quat()
+                tx, ty, tz = T[:3, 3]
+                f.write('{} {:.9f} {:.9f} {:.9f} {:.9f} {:.9f} {:.9f} {:.9f}\n'.format(
+                    r['name'], qw, qx, qy, qz, tx, ty, tz))
+        print('Poses saved to {}'.format(pose_path))
 
     # ---- evaluate against GT --------------------------------------------
     terrs, rerrs = [], []
     detail_lines = []
     for r in results:
+        if r['name'] not in query_gt:
+            continue
         gt_c2w = np.linalg.inv(query_gt[r['name']])
         R_est, C_est = r['c2w'][:3, :3], r['c2w'][:3, 3]
         R_gt, C_gt = gt_c2w[:3, :3], gt_c2w[:3, 3]
@@ -280,6 +319,10 @@ def main():
         rerrs.append(rerr)
         detail_lines.append('{:20s}  t={:8.4f} m  r={:7.3f} deg  top1={}'.format(
             r['name'], terr, rerr, r['top_names'][0]))
+
+    if not terrs:
+        print('Ground-truth pose unavailable; localization completed without pose-error evaluation.')
+        return
 
     terrs = np.array(terrs)
     rerrs = np.array(rerrs)
@@ -310,10 +353,11 @@ def main():
     report = '\n'.join(summary)
     print('\n' + report)
 
-    results_path = os.path.join(args.output_dir, 'results.txt')
-    with open(results_path, 'w') as f:
-        f.write(report + '\n')
-    print('Evaluation saved to {}'.format(results_path))
+    if args.query_image is None:
+        results_path = os.path.join(args.output_dir, 'results.txt')
+        with open(results_path, 'w') as f:
+            f.write(report + '\n')
+        print('Evaluation saved to {}'.format(results_path))
 
 
 if __name__ == '__main__':
