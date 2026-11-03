@@ -183,6 +183,15 @@ def main():
         d = image_cache.get(img_path)
         if d is None:
             d = load_images([img_path], size=int(args.img_reso), verbose=False)[0]
+            _, _, height, width = d['img'].shape
+            # W < H: pad left/right to make square (Reloc3r expects square input)
+            if width < height:
+                pad_total = height - width
+                pad_left = pad_total // 2
+                pad_right = pad_total - pad_left
+                d['img'] = torch.nn.functional.pad(
+                    d['img'], (pad_left, pad_right, 0, 0), value=-1.0)
+                d['true_shape'] = np.asarray([[height, height]], dtype=np.int32)
             image_cache[img_path] = d
         return d
 
@@ -234,6 +243,7 @@ def main():
             print('  skip {} (not enough valid db pairs)'.format(q_name))
             continue
 
+        # ！！！！
         query_c2w = visloc.motion_averaging(poses_db_c2w, poses_q2d)
         query_w2c = np.linalg.inv(query_c2w)
 
