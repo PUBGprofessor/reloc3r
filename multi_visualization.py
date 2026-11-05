@@ -60,6 +60,8 @@ def read_pose_details(path):
     pair_pattern = re.compile(
         r'Database image:\s*([^\r\n]+)\r?\n'
         r'Retrieval similarity:\s*([\d.eE+-]+)\r?\n'
+        r'(?:Translation direction error:\s*(?:[\d.eE+-]+ deg|N/A)\r?\n'
+        r'Rotation error:\s*(?:[\d.eE+-]+ deg|N/A)\r?\n)?'
         r'(\[\[.*?\]\])', re.DOTALL)
     for match in pair_pattern.finditer(content):
         db_name = match.group(1).strip()
@@ -92,7 +94,7 @@ def main():
     parser.add_argument('--map_dir', required=True)
     parser.add_argument('--query_dir', required=True)
     parser.add_argument('--details_path', required=True)
-    parser.add_argument('--ray_length', type=float, default=8.0,
+    parser.add_argument('--ray_length', type=float, default=80.0,
                         help='display length of each scale-free ray')
     parser.add_argument('--camera_scale', type=float, default=0.8,
                         help='display scale of each camera cone')
@@ -140,7 +142,11 @@ def main():
         if direction_norm < 1e-10:
             raise ValueError('Relative translation for {!r} has near-zero length'.format(db_name))
         direction /= direction_norm
+        # 射线
         geometries.append(line_geometry(db_center, db_center + args.ray_length * direction, db_color))
+        # 射线反向，长度减半
+        geometries.append(line_geometry(db_center, db_center - args.ray_length * direction / 2, db_color))
+        
 
     # Basic Open3D window: drag to rotate and scroll to zoom; no axes/panel.
     app = o3d.visualization.gui.Application.instance

@@ -122,6 +122,16 @@ def rotation_error_deg(R_est, R_gt):
     return float(np.degrees(np.arccos(cos)))
 
 
+def translation_direction_error_deg(t_est, t_gt):
+    """Angular error between translation directions, independent of scale."""
+    est_norm = np.linalg.norm(t_est)
+    gt_norm = np.linalg.norm(t_gt)
+    if est_norm < 1e-8 or gt_norm < 1e-8:
+        return None
+    cosine = np.dot(t_est, t_gt) / (est_norm * gt_norm)
+    return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+
+
 # ---------------------------------------------------------------------------
 # Localization
 # ---------------------------------------------------------------------------
@@ -132,10 +142,12 @@ def main():
     parser.add_argument('--output_dir', type=str, default=None,
                         help='default: <repo>/output/Indoor')
     parser.add_argument('--img_reso', type=str, default='512', choices=['224', '512'])
+    parser.add_argument('--image_resize', choices=['stretch', 'pad'], default='stretch',
+                        help='square input handling: stretch images (default) or pad while preserving aspect ratio')
     parser.add_argument('--topk', type=int, default=5,
                         help='number of db images per query for motion averaging')
-    parser.add_argument('--query_image', type=str, default=None,
-                        help='localize only this query image name (as stored in COLMAP/H5)')
+    parser.add_argument('--query_image', type=str, nargs='+', default=None,
+                        help='localize only these query image names (as stored in COLMAP/H5)')
     parser.add_argument('--pose_details', action='store_true',
                         help='save per-query relative poses and final pose under output_dir/pose_details')
     parser.add_argument('--amp', type=int, default=0, choices=[0, 1],
@@ -169,8 +181,11 @@ def main():
         os.path.join(args.query_dir, 'hloc_outputs', 'global-feats-megaloc.h5'))
     print('  db descriptors: {}, query descriptors: {}'.format(len(db_names), len(q_names)))
 
-    if args.query_image is not None and args.query_image not in q_names:
-        raise ValueError('Query image {!r} was not found in the query descriptors.'.format(args.query_image))
+    if args.query_image is not None:
+        missing_queries = sorted(set(args.query_image) - set(q_names))
+        if missing_queries:
+            raise ValueError('Query images not found in the query descriptors: {}'.format(
+                ', '.join(missing_queries)))
 
     # keep only db images that also have a pose and a descriptor
     keep = [i for i, n in enumerate(db_names) if n in map_gt]
@@ -191,14 +206,24 @@ def main():
         if d is None:
             d = load_images([img_path], size=int(args.img_reso), verbose=False)[0]
             _, _, height, width = d['img'].shape
-            # W < H: pad left/right to make square (Reloc3r expects square input)
-            if width < height:
-                pad_total = height - width
-                pad_left = pad_total // 2
-                pad_right = pad_total - pad_left
-                d['img'] = torch.nn.functional.pad(
-                    d['img'], (pad_left, pad_right, 0, 0), value=-1.0)
-                d['true_shape'] = np.asarray([[height, height]], dtype=np.int32)
+            if args.image_resize == 'stretch':
+                # Reloc3r expects square input; resize directly to the model resolution.
+                d['img'] = torch.nn.functional.interpolate(
+                    d['img'], size=(int(args.img_reso), int(args.img_reso)),
+                    mode='bilinear', align_corners=False)
+                d['true_shape'] = np.asarray(
+                    [[int(args.img_reso), int(args.img_reso)]], dtype=np.int32)
+            else:
+                # Pad symmetrically along the shorter dimension to preserve aspect ratio.
+                side = max(height, width)
+                pad_top = (side - height) // 2
+                pad_bottom = side - height - pad_top
+                pad_left = (side - width) // 2
+                pad_right = side - width - pad_left
+                if pad_top or pad_bottom or pad_left or pad_right:
+                    d['img'] = torch.nn.functional.pad(
+                        d['img'], (pad_left, pad_right, pad_top, pad_bottom), value=-1.0)
+                d['true_shape'] = np.asarray([[side, side]], dtype=np.int32)
             image_cache[img_path] = d
         return d
 
@@ -209,7 +234,7 @@ def main():
     # ---- localize every query ------------------------------------------
     results = []
     query_items = [(qi, name) for qi, name in enumerate(q_names)
-                   if args.query_image is None or name == args.query_image]
+                   if args.query_image is None or name in args.query_image]
     for qi, q_name in tqdm(query_items, desc='Localizing'):
         if q_name not in query_gt and args.query_image is None:
             print('  skip {} (no GT pose)'.format(q_name))
@@ -247,9 +272,19 @@ def main():
             if norm > 1e-8:
                 pose_q2d[:3, 3] = t / norm
 
+            translation_error = None
+            rotation_error = None
+            if q_name in query_gt:
+                gt_q2d = map_gt[db_name] @ np.linalg.inv(query_gt[q_name])
+                translation_error = translation_direction_error_deg(
+                    pose_q2d[:3, 3], gt_q2d[:3, 3])
+                rotation_error = rotation_error_deg(
+                    pose_q2d[:3, :3], gt_q2d[:3, :3])
+
             poses_db_c2w.append(np.linalg.inv(map_gt[db_name]))
             poses_q2d.append(pose_q2d)
-            pair_details.append((db_name, float(sims[db_idx]), pose_q2d.copy()))
+            pair_details.append((db_name, float(sims[db_idx]), pose_q2d.copy(),
+                                 translation_error, rotation_error))
 
         if len(poses_db_c2w) < 2:
             print('  skip {} (not enough valid db pairs)'.format(q_name))
@@ -276,9 +311,18 @@ def main():
             with open(details_path, 'w') as f:
                 f.write('Query image: {}\n'.format(q_name))
                 f.write('Relative poses (query-to-database; translation direction normalized):\n')
-                for db_name, similarity, relative_pose in pair_details:
+                for db_name, similarity, relative_pose, translation_error, rotation_error in pair_details:
                     f.write('\nDatabase image: {}\n'.format(db_name))
                     f.write('Retrieval similarity: {:.9f}\n'.format(similarity))
+                    if translation_error is None:
+                        f.write('Translation direction error: N/A\n')
+                    else:
+                        f.write('Translation direction error: {:.6f} deg\n'.format(
+                            translation_error))
+                    if rotation_error is None:
+                        f.write('Rotation error: N/A\n')
+                    else:
+                        f.write('Rotation error: {:.6f} deg\n'.format(rotation_error))
                     f.write('{}\n'.format(np.array2string(relative_pose, precision=9)))
                 f.write('\nFinal camera-to-world pose:\n')
                 f.write('{}\n'.format(np.array2string(query_c2w, precision=9)))
