@@ -56,6 +56,17 @@ def read_pose_details(path):
         raise ValueError('Details file is missing the query name or final c2w pose: {}'.format(path))
     query_name = query_match.group(1).strip()
     estimated_c2w = _parse_matrix(c2w_match.group(1), 'final camera-to-world pose')
+
+    # Newer details files include the rotation-consensus decision for every
+    # database candidate.  Keep this separate from the pose parser so the
+    # existing relative-pose format remains unchanged.
+    consensus = {}
+    consensus_pattern = re.compile(
+        r'^\s{2}(.*?)\s+/\s+(?:invalid|[\d.eE+-]+\s+deg)\s+/\s+(yes|no)\s*$',
+        re.MULTILINE)
+    for match in consensus_pattern.finditer(content):
+        consensus[match.group(1).strip()] = match.group(2) == 'yes'
+
     pairs = []
     pair_pattern = re.compile(
         r'Database image:\s*([^\r\n]+)\r?\n'
@@ -67,7 +78,9 @@ def read_pose_details(path):
         db_name = match.group(1).strip()
         similarity = float(match.group(2))
         relative_pose = _parse_matrix(match.group(3), 'relative pose for {}'.format(db_name))
-        pairs.append((db_name, similarity, relative_pose))
+        # ``None`` keeps old pose-details files usable when no consensus
+        # section is present.
+        pairs.append((db_name, similarity, relative_pose, consensus.get(db_name)))
     if not pairs:
         raise ValueError('No database relative poses found in {}'.format(path))
     return query_name, estimated_c2w, pairs
@@ -125,7 +138,7 @@ def main():
                                       intrinsics, estimate_color, args.camera_scale))
     labels.append((estimated_c2w[:3, 3], 'Query estimated'))
 
-    for index, (db_name, similarity, relative_pose) in enumerate(pairs):
+    for index, (db_name, similarity, relative_pose, retained) in enumerate(pairs):
         if db_name not in map_poses:
             raise KeyError('Database image {!r} is not present in map images.txt'.format(db_name))
         db_c2w = np.linalg.inv(map_poses[db_name])
@@ -133,7 +146,14 @@ def main():
         db_center = db_c2w[:3, 3]
         geometries.append(camera_geometry(db_c2w, image_width, image_height,
                                           intrinsics, db_color, args.camera_scale))
-        labels.append((db_center, '{} ({:.3f})'.format(db_name, similarity)))
+        if retained is True:
+            selection_mark = ' [selected]'
+        elif retained is False:
+            selection_mark = ' [rejected]'
+        else:
+            selection_mark = ''
+        labels.append((db_center, '{} ({:.3f}){}'.format(
+            db_name, similarity, selection_mark)))
 
         # Relative translation is scale-free. Rotate its direction to world
         # coordinates and draw the ray from the database camera center only.
@@ -145,7 +165,7 @@ def main():
         # 射线
         geometries.append(line_geometry(db_center, db_center + args.ray_length * direction, db_color))
         # 射线反向，长度减半
-        geometries.append(line_geometry(db_center, db_center - args.ray_length * direction / 2, db_color))
+        # geometries.append(line_geometry(db_center, db_center - args.ray_length * direction / 2, db_color))
         
 
     # Basic Open3D window: drag to rotate and scroll to zoom; no axes/panel.

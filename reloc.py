@@ -132,6 +132,27 @@ def translation_direction_error_deg(t_est, t_gt):
     return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
 
 
+def rotation_consensus(rotations, threshold_deg=15.0):
+    """Return pairwise angular distances, the medoid, and its inlier mask."""
+    rotations = np.asarray(rotations, dtype=np.float64)
+    if rotations.ndim != 3 or rotations.shape[1:] != (3, 3):
+        raise ValueError('Expected candidate rotations with shape (N, 3, 3).')
+    if len(rotations) == 0 or not np.isfinite(rotations).all():
+        raise ValueError('Candidate rotations are empty or contain NaN/Inf.')
+
+    distances = np.zeros((len(rotations), len(rotations)), dtype=np.float64)
+    for i in range(len(rotations)):
+        for j in range(i + 1, len(rotations)):
+            relative = rotations[i].T @ rotations[j]
+            cosine = np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0)
+            angle_deg = np.degrees(np.arccos(cosine))
+            distances[i, j] = distances[j, i] = angle_deg
+
+    medoid_idx = int(np.argmin(distances.sum(axis=1)))
+    inlier_mask = distances[medoid_idx] <= float(threshold_deg)
+    return distances, medoid_idx, inlier_mask
+
+
 # ---------------------------------------------------------------------------
 # Localization
 # ---------------------------------------------------------------------------
@@ -142,10 +163,12 @@ def main():
     parser.add_argument('--output_dir', type=str, default=None,
                         help='default: <repo>/output/Indoor')
     parser.add_argument('--img_reso', type=str, default='512', choices=['224', '512'])
-    parser.add_argument('--image_resize', choices=['stretch', 'pad'], default='stretch',
+    parser.add_argument('--image_resize', choices=['stretch', 'pad'], default='pad',
                         help='square input handling: stretch images (default) or pad while preserving aspect ratio')
     parser.add_argument('--topk', type=int, default=5,
                         help='number of db images per query for motion averaging')
+    parser.add_argument('--rotation_threshold_deg', type=float, default=15.0,
+                        help='maximum rotation distance from the medoid, in degrees')
     parser.add_argument('--query_image', type=str, nargs='+', default=None,
                         help='localize only these query image names (as stored in COLMAP/H5)')
     parser.add_argument('--pose_details', action='store_true',
@@ -153,6 +176,8 @@ def main():
     parser.add_argument('--amp', type=int, default=0, choices=[0, 1],
                         help='use Automatic Mixed Precision (fp16)')
     args = parser.parse_args()
+    if not np.isfinite(args.rotation_threshold_deg) or args.rotation_threshold_deg < 0:
+        parser.error('--rotation_threshold_deg must be a finite non-negative number')
 
     if args.output_dir is None:
         args.output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -231,6 +256,55 @@ def main():
         return {'img': img_dict['img'].to(device),
                 'true_shape': torch.as_tensor(img_dict['true_shape']).to(device)}
 
+    def save_pose_details(q_name, pair_details, candidate_count, medoid_name,
+                          consensus_rows, avg_rotation, translation_success,
+                          failure_reason, query_c2w=None, query_w2c=None):
+        if not args.pose_details:
+            return
+        details_dir = os.path.join(args.output_dir, 'pose_details')
+        os.makedirs(details_dir, exist_ok=True)
+        details_name = q_name.replace('\\', '_').replace('/', '_')
+        details_path = os.path.join(details_dir, details_name + '.txt')
+        with open(details_path, 'w') as f:
+            f.write('Query image: {}\n'.format(q_name))
+            f.write('Raw candidate count: {}\n'.format(candidate_count))
+            f.write('Rotation threshold: {:.6f} deg\n'.format(args.rotation_threshold_deg))
+            f.write('Rotation medoid: {}\n'.format(medoid_name or 'N/A'))
+            f.write('Rotation consensus (candidate / error / retained):\n')
+            for name, error_deg, retained in consensus_rows:
+                error_text = 'invalid' if error_deg is None else '{:.6f} deg'.format(error_deg)
+                f.write('  {} / {} / {}\n'.format(
+                    name, error_text, 'yes' if retained else 'no'))
+            f.write('Retained candidate count: {}\n'.format(
+                sum(1 for _, _, retained in consensus_rows if retained)))
+            f.write('Relative poses (query-to-database; translation direction normalized):\n')
+            for db_name, similarity, relative_pose, translation_error, pair_rotation_error, _ in pair_details:
+                f.write('\nDatabase image: {}\n'.format(db_name))
+                f.write('Retrieval similarity: {:.9f}\n'.format(similarity))
+                if translation_error is None:
+                    f.write('Translation direction error: N/A\n')
+                else:
+                    f.write('Translation direction error: {:.6f} deg\n'.format(
+                        translation_error))
+                if pair_rotation_error is None:
+                    f.write('Rotation error: N/A\n')
+                else:
+                    f.write('Rotation error: {:.6f} deg\n'.format(pair_rotation_error))
+                f.write('{}\n'.format(np.array2string(relative_pose, precision=9)))
+            if avg_rotation is not None:
+                f.write('\nFinal rotation average (camera-to-world):\n')
+                f.write('{}\n'.format(np.array2string(avg_rotation, precision=9)))
+            f.write('\nTranslation least-squares solve: {}\n'.format(
+                'success' if translation_success else 'failed'))
+            if failure_reason:
+                f.write('Localization failure: {}\n'.format(failure_reason))
+            if query_c2w is not None:
+                f.write('\nFinal camera-to-world pose:\n')
+                f.write('{}\n'.format(np.array2string(query_c2w, precision=9)))
+            if query_w2c is not None:
+                f.write('\nFinal world-to-camera pose:\n')
+                f.write('{}\n'.format(np.array2string(query_w2c, precision=9)))
+
     # ---- localize every query ------------------------------------------
     results = []
     query_items = [(qi, name) for qi, name in enumerate(q_names)
@@ -255,6 +329,8 @@ def main():
         poses_db_c2w = []
         poses_q2d = []
         pair_details = []
+        candidate_rotations = []
+        candidate_names = []
         for db_idx in order:
             db_name = db_names[db_idx]
             db_path = resolve_image_path(args.map_dir, map_images_dir, db_name)
@@ -266,6 +342,7 @@ def main():
             batch = [db_img, q_img]
             pose_q2d = to_numpy(inference_relpose(batch, reloc3r_relpose, device,
                                                   use_amp=bool(args.amp))[0])
+            pose_db_c2w = np.linalg.inv(map_gt[db_name])
             # Reloc3r is scale-free: keep only the direction of the translation.
             t = pose_q2d[:3, 3]
             norm = float(np.linalg.norm(t))
@@ -281,17 +358,73 @@ def main():
                 rotation_error = rotation_error_deg(
                     pose_q2d[:3, :3], gt_q2d[:3, :3])
 
-            poses_db_c2w.append(np.linalg.inv(map_gt[db_name]))
-            poses_q2d.append(pose_q2d)
+            candidate_rotation = (pose_db_c2w @ pose_q2d)[:3, :3]
+            valid_candidate = (candidate_rotation.shape == (3, 3)
+                               and np.isfinite(candidate_rotation).all()
+                               and np.isfinite(pose_q2d).all())
             pair_details.append((db_name, float(sims[db_idx]), pose_q2d.copy(),
-                                 translation_error, rotation_error))
+                                 translation_error, rotation_error,
+                                 candidate_rotation.copy() if valid_candidate else None))
+            if valid_candidate:
+                candidate_names.append(db_name)
+                candidate_rotations.append(candidate_rotation)
+                poses_db_c2w.append(pose_db_c2w)
+                poses_q2d.append(pose_q2d)
 
-        if len(poses_db_c2w) < 2:
-            print('  skip {} (not enough valid db pairs)'.format(q_name))
+        raw_candidate_count = len(pair_details)
+        consensus_rows = [(detail[0], None, False) for detail in pair_details]
+        medoid_name = None
+        avg_rotation = None
+        translation_success = False
+        failure_reason = None
+        if len(candidate_rotations) == 0:
+            failure_reason = 'no finite candidate rotations'
+            print('  skip {} ({})'.format(q_name, failure_reason))
+            save_pose_details(q_name, pair_details, raw_candidate_count, medoid_name,
+                              consensus_rows, avg_rotation, translation_success,
+                              failure_reason)
             continue
 
-        # ！！！！
-        query_c2w = visloc.motion_averaging(poses_db_c2w, poses_q2d)
+        distances, medoid_idx, inlier_mask = rotation_consensus(
+            candidate_rotations, threshold_deg=args.rotation_threshold_deg)
+        medoid_name = candidate_names[medoid_idx]
+        valid_detail_indices = [i for i, detail in enumerate(pair_details)
+                                if detail[5] is not None]
+        for local_idx, detail_idx in enumerate(valid_detail_indices):
+            consensus_rows[detail_idx] = (
+                pair_details[detail_idx][0],
+                float(distances[medoid_idx, local_idx]),
+                bool(inlier_mask[local_idx]))
+
+        # Apply the same consensus indices to every corresponding candidate input.
+        poses_db_c2w = [pose for pose, keep in zip(poses_db_c2w, inlier_mask) if keep]
+        poses_q2d = [pose for pose, keep in zip(poses_q2d, inlier_mask) if keep]
+        retained_count = int(np.count_nonzero(inlier_mask))
+        print('  {}: {} candidates, medoid={}, retained={}'.format(
+            q_name, raw_candidate_count, medoid_name, retained_count))
+        if retained_count < 2:
+            failure_reason = 'rotation consensus retained fewer than 2 candidates'
+            print('  skip {} ({})'.format(q_name, failure_reason))
+            save_pose_details(q_name, pair_details, raw_candidate_count, medoid_name,
+                              consensus_rows, avg_rotation, translation_success,
+                              failure_reason)
+            continue
+
+        try:
+            candidate_abs_rotations = np.asarray([
+                (pose_db @ pose_q)[:3, :3]
+                for pose_db, pose_q in zip(poses_db_c2w, poses_q2d)])
+            avg_rotation = visloc.rotation_averaging(candidate_abs_rotations)
+            query_c2w = visloc.motion_averaging(poses_db_c2w, poses_q2d)
+            translation_success = True
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
+            failure_reason = str(exc)
+            print('  skip {} (motion averaging failed: {})'.format(q_name, failure_reason))
+            save_pose_details(q_name, pair_details, raw_candidate_count, medoid_name,
+                              consensus_rows, avg_rotation, translation_success,
+                              failure_reason)
+            continue
+
         query_w2c = np.linalg.inv(query_c2w)
 
         results.append(dict(name=q_name, w2c=query_w2c, c2w=query_c2w,
@@ -303,32 +436,9 @@ def main():
             print('Estimated pose (camera-to-world):\n', query_c2w)
             print('Estimated pose (world-to-camera):\n', query_w2c)
 
-        if args.pose_details:
-            details_dir = os.path.join(args.output_dir, 'pose_details')
-            os.makedirs(details_dir, exist_ok=True)
-            details_name = q_name.replace('\\', '_').replace('/', '_')
-            details_path = os.path.join(details_dir, details_name + '.txt')
-            with open(details_path, 'w') as f:
-                f.write('Query image: {}\n'.format(q_name))
-                f.write('Relative poses (query-to-database; translation direction normalized):\n')
-                for db_name, similarity, relative_pose, translation_error, rotation_error in pair_details:
-                    f.write('\nDatabase image: {}\n'.format(db_name))
-                    f.write('Retrieval similarity: {:.9f}\n'.format(similarity))
-                    if translation_error is None:
-                        f.write('Translation direction error: N/A\n')
-                    else:
-                        f.write('Translation direction error: {:.6f} deg\n'.format(
-                            translation_error))
-                    if rotation_error is None:
-                        f.write('Rotation error: N/A\n')
-                    else:
-                        f.write('Rotation error: {:.6f} deg\n'.format(rotation_error))
-                    f.write('{}\n'.format(np.array2string(relative_pose, precision=9)))
-                f.write('\nFinal camera-to-world pose:\n')
-                f.write('{}\n'.format(np.array2string(query_c2w, precision=9)))
-                f.write('\nFinal world-to-camera pose:\n')
-                f.write('{}\n'.format(np.array2string(query_w2c, precision=9)))
-            print('Pose details saved to {}'.format(details_path))
+        save_pose_details(q_name, pair_details, raw_candidate_count, medoid_name,
+                          consensus_rows, avg_rotation, translation_success,
+                          failure_reason, query_c2w, query_w2c)
 
     if len(results) == 0:
         print('No query localized, aborting.')
