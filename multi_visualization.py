@@ -104,8 +104,10 @@ def line_geometry(start, end, color):
 
 def main():
     parser = argparse.ArgumentParser(description='Interactive multi-view Reloc3r visualization.')
-    parser.add_argument('--map_dir', required=True)
-    parser.add_argument('--query_dir', required=True)
+    # parser.add_argument('--map_dir', required=True)
+    # parser.add_argument('--query_dir', required=True)
+    parser.add_argument('--map_dir', type=str, default=r'D:\Datasets\Indoor_map_51')
+    parser.add_argument('--query_dir', type=str, default=r'D:\Datasets\Indoor_query_38_38')
     parser.add_argument('--details_path', required=True)
     parser.add_argument('--ray_length', type=float, default=80.0,
                         help='display length of each scale-free ray')

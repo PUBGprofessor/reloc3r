@@ -158,8 +158,8 @@ def rotation_consensus(rotations, threshold_deg=15.0):
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description='Reloc3r visual localization on Indoor (map/query).')
-    parser.add_argument('--map_dir', type=str, default=r'D:\Datasets\Indoor_map')
-    parser.add_argument('--query_dir', type=str, default=r'D:\Datasets\Indoor_query')
+    parser.add_argument('--map_dir', type=str, default=r'D:\Datasets\Indoor_map_51')
+    parser.add_argument('--query_dir', type=str, default=r'D:\Datasets\Indoor_query_38_38')
     parser.add_argument('--output_dir', type=str, default=None,
                         help='default: <repo>/output/Indoor')
     parser.add_argument('--img_reso', type=str, default='512', choices=['224', '512'])
@@ -196,8 +196,8 @@ def main():
     query_gt = read_colmap_images_txt(os.path.join(args.query_dir, 'sparse', '0', 'images.txt'))
     print('  map images: {}, query images: {}'.format(len(map_gt), len(query_gt)))
 
-    # ---- NetVLAD descriptors -------------------------------------------
-    print('Loading NetVLAD global descriptors...')
+    # ---- Megaloc descriptors -------------------------------------------
+    print('Loading Megaloc global descriptors...')
     db_names, db_descs_all = load_netvlad_h5(
         # os.path.join(args.map_dir, 'hloc_outputs', 'global-feats-netvlad.h5'))
         os.path.join(args.map_dir, 'hloc_outputs', 'global-feats-megaloc.h5'))
@@ -384,7 +384,7 @@ def main():
                               consensus_rows, avg_rotation, translation_success,
                               failure_reason)
             continue
-
+        # 旋转一致性筛选
         distances, medoid_idx, inlier_mask = rotation_consensus(
             candidate_rotations, threshold_deg=args.rotation_threshold_deg)
         medoid_name = candidate_names[medoid_idx]
