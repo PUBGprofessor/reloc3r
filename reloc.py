@@ -153,6 +153,99 @@ def rotation_consensus(rotations, threshold_deg=15.0):
     return distances, medoid_idx, inlier_mask
 
 
+def translation_ray_consensus(centers, directions, candidate_names,
+                              parallel_threshold_deg=5.0):
+    """Filter ray outliers using robust statistics of pairwise half-ray distances."""
+    centers = np.asarray(centers, dtype=np.float64)
+    directions = np.asarray(directions, dtype=np.float64)
+    count = len(centers)
+    if centers.shape != (count, 3) or directions.shape != (count, 3):
+        raise ValueError('Ray centers and directions must have shape (N, 3).')
+    if len(candidate_names) != count:
+        raise ValueError('Ray candidate names must match the candidate count.')
+    if not np.isfinite(centers).all() or not np.isfinite(directions).all():
+        raise ValueError('Ray centers or directions contain NaN/Inf.')
+    norms = np.linalg.norm(directions, axis=1)
+    if np.any(norms < 1e-12):
+        raise ValueError('Ray direction has near-zero length.')
+    directions = directions / norms[:, None]
+
+    distances = np.full((count, count), np.nan, dtype=np.float64)
+    angles = np.full((count, count), np.nan, dtype=np.float64)
+    skipped_pairs = []
+    for i in range(count):
+        for j in range(i + 1, count):
+            dot = float(np.clip(np.dot(directions[i], directions[j]), -1.0, 1.0))
+            angle_deg = float(np.degrees(np.arccos(np.clip(abs(dot), 0.0, 1.0))))
+            angles[i, j] = angles[j, i] = angle_deg
+            if angle_deg < parallel_threshold_deg:
+                skipped_pairs.append((i, j, angle_deg))
+                continue
+
+            # Minimize |(C_i + s*d_i) - (C_j + t*d_j)| with s,t >= 0.
+            # The unconstrained solution is valid when both parameters are
+            # forward; otherwise the constrained minimum lies on a boundary.
+            w = centers[i] - centers[j]
+            b = float(np.dot(directions[i], directions[j]))
+            rhs_i = -float(np.dot(directions[i], w))
+            rhs_j = float(np.dot(directions[j], w))
+            denom = 1.0 - b * b
+            candidates = [(0.0, 0.0)]
+            if denom > 1e-12:
+                s = (rhs_i + b * rhs_j) / denom
+                t = (rhs_j + b * rhs_i) / denom
+                if s >= 0.0 and t >= 0.0:
+                    candidates.append((s, t))
+            # Boundary minima: s=0, t=0, and their shared endpoint.
+            candidates.append((0.0, max(0.0, rhs_j)))
+            candidates.append((max(0.0, rhs_i), 0.0))
+            distances[i, j] = distances[j, i] = min(
+                np.linalg.norm(w + s * directions[i] - t * directions[j])
+                for s, t in candidates)
+
+    min_comparisons = max(2, int(np.ceil(0.5 * (count - 1))))
+    scores = np.full(count, np.nan, dtype=np.float64)
+    valid_counts = np.zeros(count, dtype=np.int32)
+    for i in range(count):
+        valid = np.isfinite(distances[i])
+        valid_counts[i] = int(valid.sum())
+        if valid_counts[i] >= min_comparisons:
+            scores[i] = float(np.median(distances[i, valid]))
+
+    score_valid = np.isfinite(scores)
+    inlier_mask = np.ones(count, dtype=bool)
+    median_score = mad = threshold = float('nan')
+    outlier_indices = []
+    if int(score_valid.sum()) >= 3:
+        median_score = float(np.median(scores[score_valid]))
+        mad = float(np.median(np.abs(scores[score_valid] - median_score)))
+        sigma = 1.4826 * mad
+        threshold = max(2.0 * median_score, median_score + 4.0 * sigma)
+        inlier_mask[score_valid] = scores[score_valid] <= threshold
+        outlier_indices = np.flatnonzero(~inlier_mask).tolist()
+        min_remaining = max(2, int(np.ceil(0.5 * count)))
+        if count - len(outlier_indices) < min_remaining:
+            inlier_mask[:] = True
+            outlier_indices = []
+    else:
+        sigma = float('nan')
+
+    details = {
+        'angles': angles,
+        'distances': distances,
+        'skipped_pairs': skipped_pairs,
+        'valid_counts': valid_counts,
+        'scores': scores,
+        'min_comparisons': min_comparisons,
+        'median': median_score,
+        'mad': mad,
+        'sigma': sigma,
+        'threshold': threshold,
+        'outlier_indices': outlier_indices,
+    }
+    return inlier_mask, details
+
+
 # ---------------------------------------------------------------------------
 # Localization
 # ---------------------------------------------------------------------------
@@ -169,6 +262,8 @@ def main():
                         help='number of db images per query for motion averaging')
     parser.add_argument('--rotation_threshold_deg', type=float, default=15.0,
                         help='maximum rotation distance from the medoid, in degrees')
+    parser.add_argument('--translation_parallel_threshold_deg', type=float, default=5.0,
+                        help='skip ray-pair distances below this acute angle, in degrees')
     parser.add_argument('--query_image', type=str, nargs='+', default=None,
                         help='localize only these query image names (as stored in COLMAP/H5)')
     parser.add_argument('--pose_details', action='store_true',
@@ -178,6 +273,9 @@ def main():
     args = parser.parse_args()
     if not np.isfinite(args.rotation_threshold_deg) or args.rotation_threshold_deg < 0:
         parser.error('--rotation_threshold_deg must be a finite non-negative number')
+    if (not np.isfinite(args.translation_parallel_threshold_deg)
+            or not 0.0 <= args.translation_parallel_threshold_deg <= 90.0):
+        parser.error('--translation_parallel_threshold_deg must be between 0 and 90')
 
     if args.output_dir is None:
         args.output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -305,6 +403,43 @@ def main():
                 f.write('\nFinal world-to-camera pose:\n')
                 f.write('{}\n'.format(np.array2string(query_w2c, precision=9)))
 
+    def save_translation_details(q_name, names, keep_mask, details):
+        details_dir = os.path.join(args.output_dir, 'pose_details')
+        os.makedirs(details_dir, exist_ok=True)
+        details_path = os.path.join(details_dir, q_name.replace('\\', '_').replace('/', '_')
+                                    + '.trans.txt')
+        with open(details_path, 'w') as f:
+            f.write('Query image: {}\n'.format(q_name))
+            f.write('Candidate count before translation filtering: {}\n'.format(len(names)))
+            f.write('Parallel-pair threshold: {:.6f} deg\n'.format(
+                args.translation_parallel_threshold_deg))
+            f.write('Pairwise acute ray angles (deg; NaN means unavailable):\n')
+            f.write('{}\n'.format(np.array2string(details['angles'], precision=6)))
+            f.write('Skipped near-parallel pairs (< threshold):\n')
+            for i, j, angle in details['skipped_pairs']:
+                f.write('  {} <-> {}: {:.6f} deg\n'.format(names[i], names[j], angle))
+            f.write('Pairwise half-ray distance matrix (NaN means invalid/skipped):\n')
+            f.write('{}\n'.format(np.array2string(details['distances'], precision=6)))
+            f.write('Minimum valid comparisons per candidate: {}\n'.format(
+                details['min_comparisons']))
+            f.write('Candidate scores (valid comparisons / median distance / status):\n')
+            for i, name in enumerate(names):
+                score = details['scores'][i]
+                score_text = 'Insufficient Geometry' if not np.isfinite(score) else '{:.6f}'.format(score)
+                status = 'retained' if keep_mask[i] else 'rejected'
+                f.write('  {} / {} / {} / {}\n'.format(
+                    name, int(details['valid_counts'][i]), score_text, status))
+            f.write('m: {}\n'.format(details['median']))
+            f.write('MAD: {}\n'.format(details['mad']))
+            f.write('Robust sigma: {}\n'.format(details['sigma']))
+            f.write('Final threshold T: {}\n'.format(details['threshold']))
+            f.write('Retained candidates: {}\n'.format(
+                ', '.join(name for name, keep in zip(names, keep_mask) if keep)))
+            f.write('Rejected candidates: {}\n'.format(
+                ', '.join(name for name, keep in zip(names, keep_mask) if not keep) or 'None'))
+            f.write('Candidate count after translation filtering: {}\n'.format(
+                int(np.count_nonzero(keep_mask))))
+
     # ---- localize every query ------------------------------------------
     results = []
     query_items = [(qi, name) for qi, name in enumerate(q_names)
@@ -399,6 +534,7 @@ def main():
         # Apply the same consensus indices to every corresponding candidate input.
         poses_db_c2w = [pose for pose, keep in zip(poses_db_c2w, inlier_mask) if keep]
         poses_q2d = [pose for pose, keep in zip(poses_q2d, inlier_mask) if keep]
+        candidate_names = [name for name, keep in zip(candidate_names, inlier_mask) if keep]
         retained_count = int(np.count_nonzero(inlier_mask))
         print('  {}: {} candidates, medoid={}, retained={}'.format(
             q_name, raw_candidate_count, medoid_name, retained_count))
@@ -409,6 +545,25 @@ def main():
                               consensus_rows, avg_rotation, translation_success,
                               failure_reason)
             continue
+
+        # Translation consistency uses the same ray endpoints/directions as
+        # Motion Averaging, preserving candidate correspondence by one mask.
+        ray_centers = np.asarray([pose_db[:3, 3] for pose_db in poses_db_c2w],
+                                 dtype=np.float64)
+        ray_directions = np.asarray([
+            pose_db[:3, :3] @ pose_q[:3, 3]
+            for pose_db, pose_q in zip(poses_db_c2w, poses_q2d)], dtype=np.float64)
+        translation_keep, translation_details = translation_ray_consensus(
+            ray_centers, ray_directions, candidate_names,
+            parallel_threshold_deg=args.translation_parallel_threshold_deg)
+        save_translation_details(q_name, candidate_names, translation_keep,
+                                 translation_details)
+        before_translation_count = len(candidate_names)
+        poses_db_c2w = [pose for pose, keep in zip(poses_db_c2w, translation_keep) if keep]
+        poses_q2d = [pose for pose, keep in zip(poses_q2d, translation_keep) if keep]
+        candidate_names = [name for name, keep in zip(candidate_names, translation_keep) if keep]
+        print('  {}: translation consistency retained {}/{} candidates'.format(
+            q_name, len(candidate_names), before_translation_count))
 
         try:
             candidate_abs_rotations = np.asarray([
