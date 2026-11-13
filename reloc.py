@@ -262,8 +262,18 @@ def main():
                         help='number of db images per query for motion averaging')
     parser.add_argument('--rotation_threshold_deg', type=float, default=15.0,
                         help='maximum rotation distance from the medoid, in degrees')
+    parser.add_argument('--rotation_consensus', dest='rotation_consensus',
+                        action='store_true', default=True,
+                        help='enable rotation-consensus filtering (default: enabled)')
+    parser.add_argument('--no_rotation_consensus', dest='rotation_consensus',
+                        action='store_false', help='disable rotation-consensus filtering')
     parser.add_argument('--translation_parallel_threshold_deg', type=float, default=5.0,
                         help='skip ray-pair distances below this acute angle, in degrees')
+    parser.add_argument('--translation_consensus', dest='translation_consensus',
+                        action='store_true', default=True,
+                        help='enable translation-consensus filtering (default: enabled)')
+    parser.add_argument('--no_translation_consensus', dest='translation_consensus',
+                        action='store_false', help='disable translation-consensus filtering')
     parser.add_argument('--query_image', type=str, nargs='+', default=None,
                         help='localize only these query image names (as stored in COLMAP/H5)')
     parser.add_argument('--pose_details', action='store_true',
@@ -519,17 +529,22 @@ def main():
                               consensus_rows, avg_rotation, translation_success,
                               failure_reason)
             continue
-        # 旋转一致性筛选
-        distances, medoid_idx, inlier_mask = rotation_consensus(
-            candidate_rotations, threshold_deg=args.rotation_threshold_deg)
-        medoid_name = candidate_names[medoid_idx]
-        valid_detail_indices = [i for i, detail in enumerate(pair_details)
-                                if detail[5] is not None]
-        for local_idx, detail_idx in enumerate(valid_detail_indices):
-            consensus_rows[detail_idx] = (
-                pair_details[detail_idx][0],
-                float(distances[medoid_idx, local_idx]),
-                bool(inlier_mask[local_idx]))
+        # 第一步：按旋转 medoid 筛选候选；关闭时使用全 True 掩码保留全部候选。
+        if args.rotation_consensus:
+            distances, medoid_idx, inlier_mask = rotation_consensus(
+                candidate_rotations, threshold_deg=args.rotation_threshold_deg)
+            medoid_name = candidate_names[medoid_idx]
+            valid_detail_indices = [i for i, detail in enumerate(pair_details)
+                                    if detail[5] is not None]
+            for local_idx, detail_idx in enumerate(valid_detail_indices):
+                consensus_rows[detail_idx] = (
+                    pair_details[detail_idx][0],
+                    float(distances[medoid_idx, local_idx]),
+                    bool(inlier_mask[local_idx]))
+        else:
+            inlier_mask = np.ones(len(candidate_names), dtype=bool)
+            consensus_rows = [(detail[0], None, detail[5] is not None)
+                              for detail in pair_details]
 
         # Apply the same consensus indices to every corresponding candidate input.
         poses_db_c2w = [pose for pose, keep in zip(poses_db_c2w, inlier_mask) if keep]
@@ -546,24 +561,25 @@ def main():
                               failure_reason)
             continue
 
-        # Translation consistency uses the same ray endpoints/directions as
-        # Motion Averaging, preserving candidate correspondence by one mask.
-        ray_centers = np.asarray([pose_db[:3, 3] for pose_db in poses_db_c2w],
-                                 dtype=np.float64)
-        ray_directions = np.asarray([
-            pose_db[:3, :3] @ pose_q[:3, 3]
-            for pose_db, pose_q in zip(poses_db_c2w, poses_q2d)], dtype=np.float64)
-        translation_keep, translation_details = translation_ray_consensus(
-            ray_centers, ray_directions, candidate_names,
-            parallel_threshold_deg=args.translation_parallel_threshold_deg)
-        save_translation_details(q_name, candidate_names, translation_keep,
-                                 translation_details)
+        # 第二步：从传给平均算法的同一候选生成射线，并同步应用平移筛选掩码。
         before_translation_count = len(candidate_names)
-        poses_db_c2w = [pose for pose, keep in zip(poses_db_c2w, translation_keep) if keep]
-        poses_q2d = [pose for pose, keep in zip(poses_q2d, translation_keep) if keep]
-        candidate_names = [name for name, keep in zip(candidate_names, translation_keep) if keep]
-        print('  {}: translation consistency retained {}/{} candidates'.format(
-            q_name, len(candidate_names), before_translation_count))
+        if args.translation_consensus:
+            ray_centers = np.asarray([pose_db[:3, 3] for pose_db in poses_db_c2w],
+                                     dtype=np.float64)
+            ray_directions = np.asarray([
+                pose_db[:3, :3] @ pose_q[:3, 3]
+                for pose_db, pose_q in zip(poses_db_c2w, poses_q2d)], dtype=np.float64)
+            translation_keep, translation_details = translation_ray_consensus(
+                ray_centers, ray_directions, candidate_names,
+                parallel_threshold_deg=args.translation_parallel_threshold_deg)
+            save_translation_details(q_name, candidate_names, translation_keep,
+                                     translation_details)
+            poses_db_c2w = [pose for pose, keep in zip(poses_db_c2w, translation_keep) if keep]
+            poses_q2d = [pose for pose, keep in zip(poses_q2d, translation_keep) if keep]
+            candidate_names = [name for name, keep in zip(candidate_names, translation_keep) if keep]
+        print('  {}: translation consistency {}/{} candidates{}'.format(
+            q_name, len(candidate_names), before_translation_count,
+            ' retained' if args.translation_consensus else ' (disabled)'))
 
         try:
             candidate_abs_rotations = np.asarray([
