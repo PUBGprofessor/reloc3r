@@ -123,13 +123,32 @@ def main():
     parser.add_argument('--topk', type=int, default=8)
     parser.add_argument('--img_reso', choices=['224', '512'], default='512')
     parser.add_argument('--image_resize', choices=['stretch', 'pad'], default='pad')
-    parser.add_argument('--rotation_threshold_deg', type=float, default=15.0)
-    parser.add_argument('--translation_parallel_threshold_deg', type=float, default=5.0)
+    parser.add_argument('--rotation_threshold_deg', type=float, default=15.0,
+                        help='medoid 旋转一致性角度阈值（度；与方法.md 一致）')
+    parser.add_argument('--rotation_consensus', dest='rotation_consensus',
+                        action='store_true', default=True,
+                        help='开启旋转一致性筛选（默认开启）')
+    parser.add_argument('--no_rotation_consensus', dest='rotation_consensus',
+                        action='store_false', help='关闭旋转一致性筛选')
+    parser.add_argument('--translation_parallel_threshold_deg', type=float, default=5.0,
+                        help='射线夹角小于该阈值时跳过射线距离计算（度）')
+    parser.add_argument('--translation_consensus', dest='translation_consensus',
+                        action='store_true', default=True,
+                        help='开启平移射线一致性筛选（默认开启）')
+    parser.add_argument('--no_translation_consensus', dest='translation_consensus',
+                        action='store_false', help='关闭平移射线一致性筛选')
     parser.add_argument('--query_image', nargs='+')
+    parser.add_argument('--pose_details', action='store_true',
+                        help='在 output_dir/pose_details 下保存逐 query 的筛选详情')
     parser.add_argument('--amp', type=int, choices=[0, 1], default=0)
     args = parser.parse_args()
     if args.topk < 1:
         parser.error('--topk must be positive')
+    if not np.isfinite(args.rotation_threshold_deg) or args.rotation_threshold_deg < 0:
+        parser.error('--rotation_threshold_deg must be finite and non-negative')
+    if (not np.isfinite(args.translation_parallel_threshold_deg)
+            or not 0.0 <= args.translation_parallel_threshold_deg <= 90.0):
+        parser.error('--translation_parallel_threshold_deg must be between 0 and 90')
     if args.output_dir is None:
         args.output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output', 'InLoc')
     os.makedirs(args.output_dir, exist_ok=True)
@@ -157,18 +176,102 @@ def main():
         if path not in cache:
             item = load_images([path], size=int(args.img_reso), verbose=False)[0]
             _, _, h, w = item['img'].shape
-            if args.image_resize == 'stretch':
-                item['img'] = torch.nn.functional.interpolate(item['img'], size=(int(args.img_reso),) * 2,
-                                                              mode='bilinear', align_corners=False)
-                item['true_shape'] = np.asarray([[int(args.img_reso)] * 2], dtype=np.int32)
-            else:
-                side = max(h, w)
-                t, l = (side - h) // 2, (side - w) // 2
-                item['img'] = torch.nn.functional.pad(item['img'], (l, side - w - l, t, side - h - t), value=-1.0)
+            # Reloc3r 只接受横屏方向。横屏和正方形图像保持 load_images 的
+            # 输出，不做额外缩放或补边；只有竖屏图像才按参数转换成正方形。
+            if w < h:
+                side = h
+                if args.image_resize == 'stretch':
+                    # stretch：将竖屏图像直接拉伸到 h x h，可能改变图像比例。
+                    item['img'] = torch.nn.functional.interpolate(
+                        item['img'], size=(side, side), mode='bilinear',
+                        align_corners=False)
+                else:
+                    # pad：保持竖屏图像比例，在左右对称补边到 h x h。
+                    pad_left = (side - w) // 2
+                    pad_right = side - w - pad_left
+                    item['img'] = torch.nn.functional.pad(
+                        item['img'], (pad_left, pad_right, 0, 0), value=-1.0)
                 item['true_shape'] = np.asarray([[side, side]], dtype=np.int32)
             cache[path] = item
         item = cache[path]
         return {'img': item['img'].to(device), 'true_shape': torch.as_tensor(item['true_shape']).to(device)}
+
+    def save_pose_details(query, pair_details, rotation_rows, medoid_name,
+                          failure_reason=None, query_c2w=None, query_w2c=None):
+        """保存 query 的相对位姿、绝对旋转一致性及最终位姿诊断。"""
+        if not args.pose_details:
+            return
+        details_dir = Path(args.output_dir) / 'pose_details'
+        details_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = query.replace('\\', '_').replace('/', '_')
+        details_path = details_dir / (safe_name + '.txt')
+        with details_path.open('w', encoding='utf-8') as f:
+            f.write('Query image: {}\n'.format(query))
+            f.write('Top-K: {}\n'.format(args.topk))
+            f.write('Rotation consensus enabled: {}\n'.format(args.rotation_consensus))
+            f.write('Rotation threshold: {:.6f} deg\n'.format(args.rotation_threshold_deg))
+            f.write('Rotation medoid: {}\n'.format(medoid_name or 'N/A'))
+            f.write('Rotation consensus (candidate / medoid error / retained):\n')
+            for name, error, keep in rotation_rows:
+                error_text = 'N/A' if error is None else '{:.6f} deg'.format(error)
+                f.write('  {} / {} / {}\n'.format(name, error_text,
+                                                   'yes' if keep else 'no'))
+            f.write('Relative poses (query-to-database; normalized translation):\n')
+            for row in pair_details:
+                f.write('\nDatabase image: {}\n'.format(row['name']))
+                f.write('  valid: {}\n'.format(row['valid']))
+                if row['pose'] is not None:
+                    f.write('{}\n'.format(np.array2string(row['pose'], precision=9)))
+                if row['absolute_rotation'] is not None:
+                    f.write('Estimated query rotation (world):\n')
+                    f.write('{}\n'.format(np.array2string(
+                        row['absolute_rotation'], precision=9)))
+            if failure_reason:
+                f.write('\nLocalization failure: {}\n'.format(failure_reason))
+            if query_c2w is not None:
+                f.write('\nFinal camera-to-world pose:\n')
+                f.write('{}\n'.format(np.array2string(query_c2w, precision=9)))
+            if query_w2c is not None:
+                f.write('\nFinal world-to-camera pose:\n')
+                f.write('{}\n'.format(np.array2string(query_w2c, precision=9)))
+
+    def save_translation_details(query, names, keep_mask, details):
+        """按 reloc.py 格式写出射线夹角、距离矩阵和鲁棒分数。"""
+        if not args.pose_details:
+            return
+        details_dir = Path(args.output_dir) / 'pose_details'
+        details_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = query.replace('\\', '_').replace('/', '_')
+        details_path = details_dir / (safe_name + '.trans.txt')
+        with details_path.open('w', encoding='utf-8') as f:
+            f.write('Query image: {}\n'.format(query))
+            f.write('Candidate count before translation filtering: {}\n'.format(len(names)))
+            f.write('Translation consensus enabled: {}\n'.format(args.translation_consensus))
+            f.write('Parallel-pair threshold: {:.6f} deg\n'.format(
+                args.translation_parallel_threshold_deg))
+            f.write('Pairwise acute ray angles (deg; NaN means unavailable):\n')
+            f.write('{}\n'.format(np.array2string(details['angles'], precision=6)))
+            f.write('Skipped near-parallel pairs:\n')
+            for i, j, angle in details['skipped_pairs']:
+                f.write('  {} <-> {}: {:.6f} deg\n'.format(names[i], names[j], angle))
+            f.write('Pairwise half-ray distance matrix (NaN means invalid/skipped):\n')
+            f.write('{}\n'.format(np.array2string(details['distances'], precision=6)))
+            f.write('Minimum valid comparisons per candidate: {}\n'.format(
+                details['min_comparisons']))
+            f.write('Candidate scores (valid comparisons / median distance / status):\n')
+            for i, name in enumerate(names):
+                score = details['scores'][i]
+                score_text = ('Insufficient Geometry' if not np.isfinite(score)
+                              else '{:.6f}'.format(score))
+                status = 'retained' if keep_mask[i] else 'rejected'
+                f.write('  {} / {} / {} / {}\n'.format(
+                    name, int(details['valid_counts'][i]), score_text, status))
+            f.write('Median: {}\nMAD: {}\nRobust sigma: {}\nThreshold: {}\n'.format(
+                details['median'], details['mad'], details['sigma'], details['threshold']))
+            f.write('Retained candidates: {}\n'.format(
+                ', '.join(n for n, keep in zip(names, keep_mask) if keep)))
+            f.write('Rejected candidates: {}\n'.format(
+                ', '.join(n for n, keep in zip(names, keep_mask) if not keep) or 'None'))
 
     results = []
     for query, database_names in tqdm(pairs.items(), desc='Localizing InLoc'):
@@ -178,6 +281,7 @@ def main():
             continue
         q_img = image(query_path)
         poses_db, poses_q2d, rotations, used_names = [], [], [], []
+        pair_details = []
         for db_name in database_names[:args.topk]:
             db_path = root / Path(db_name.replace('\\', '/'))
             if not db_path.is_file():
@@ -195,48 +299,76 @@ def main():
                                               use_amp=bool(args.amp))[0])
             norm = np.linalg.norm(pred[:3, 3])
             if norm < 1e-8 or not np.isfinite(pred).all():
+                pair_details.append({'name': db_name, 'pose': pred.copy(),
+                                     'absolute_rotation': None, 'valid': False})
                 continue
             pred[:3, 3] /= norm
+            absolute_rotation = (T_db @ pred)[:3, :3]
+            pair_details.append({'name': db_name, 'pose': pred.copy(),
+                                 'absolute_rotation': absolute_rotation.copy(), 'valid': True})
             poses_db.append(T_db)
             poses_q2d.append(pred)
-            rotations.append((T_db @ pred)[:3, :3])
+            rotations.append(absolute_rotation)
             used_names.append(db_name)
         if len(poses_db) < 2:
             print('Skip {}: fewer than two valid candidates'.format(query))
+            save_pose_details(query, pair_details, [], None,
+                              'fewer than two valid candidates')
             continue
         # 先比较每个候选推得的 query 绝对旋转，只留下 medoid 邻域内的候选。
-        distances, medoid, keep = rotation_consensus(rotations, args.rotation_threshold_deg)
-        if np.count_nonzero(keep) < 2:
+        distances, medoid, rotation_keep = rotation_consensus(
+            rotations, args.rotation_threshold_deg)
+        medoid_name = used_names[medoid]
+        rotation_rows = [(name, float(distances[medoid, i]), bool(rotation_keep[i]))
+                         for i, name in enumerate(used_names)]
+        if not args.rotation_consensus:
+            rotation_keep = np.ones(len(used_names), dtype=bool)
+            rotation_rows = [(name, None, True) for name in used_names]
+        if np.count_nonzero(rotation_keep) < 2:
             medoid_distances = np.sort(distances[medoid])
             print('Skip {}: rotation consensus kept {}/{} (threshold {:.1f} deg; '
                   'nearest distances {})'.format(
-                      query, int(np.count_nonzero(keep)), len(keep),
+                      query, int(np.count_nonzero(rotation_keep)), len(rotation_keep),
                       args.rotation_threshold_deg,
                       np.array2string(medoid_distances[:5], precision=1)))
+            save_pose_details(query, pair_details, rotation_rows, medoid_name,
+                              'rotation consensus retained fewer than two candidates')
             continue
-        poses_db = [p for p, k in zip(poses_db, keep) if k]
-        poses_q2d = [p for p, k in zip(poses_q2d, keep) if k]
-        used_names = [n for n, k in zip(used_names, keep) if k]
+        poses_db = [p for p, k in zip(poses_db, rotation_keep) if k]
+        poses_q2d = [p for p, k in zip(poses_q2d, rotation_keep) if k]
+        used_names = [n for n, k in zip(used_names, rotation_keep) if k]
         if len(poses_db) < 2:
             print('Skip {}: rotation consensus retained fewer than two candidates'.format(query))
+            save_pose_details(query, pair_details, rotation_rows, medoid_name,
+                              'rotation consensus retained fewer than two candidates')
             continue
         # 每个 map 位姿给出射线起点；相对平移方向经 map 朝向转到全局坐标系。
         centers = np.asarray([p[:3, 3] for p in poses_db])
         directions = np.asarray([p[:3, :3] @ q[:3, 3] for p, q in zip(poses_db, poses_q2d)])
-        keep_t, _ = translation_ray_consensus(centers, directions, used_names,
-                                               args.translation_parallel_threshold_deg)
-        poses_db = [p for p, k in zip(poses_db, keep_t) if k]
-        poses_q2d = [p for p, k in zip(poses_q2d, keep_t) if k]
+        translation_keep, translation_details = translation_ray_consensus(
+            centers, directions, used_names,
+            args.translation_parallel_threshold_deg)
+        if not args.translation_consensus:
+            translation_keep = np.ones(len(used_names), dtype=bool)
+        save_translation_details(query, used_names, translation_keep, translation_details)
+        poses_db = [p for p, k in zip(poses_db, translation_keep) if k]
+        poses_q2d = [p for p, k in zip(poses_q2d, translation_keep) if k]
         if len(poses_db) < 2:
             print('Skip {}: translation consensus retained fewer than two candidates'.format(query))
+            save_pose_details(query, pair_details, rotation_rows, medoid_name,
+                              'translation consensus retained fewer than two candidates')
             continue
         # 对通过两级一致性筛选的候选执行旋转平均和射线交会。
         try:
             pose_c2w = visloc.motion_averaging(poses_db, poses_q2d)
         except (ValueError, np.linalg.LinAlgError, FloatingPointError) as exc:
             print('Skip {}: {}'.format(query, exc))
+            save_pose_details(query, pair_details, rotation_rows, medoid_name, str(exc))
             continue
-        results.append((query, np.linalg.inv(pose_c2w), medoid, len(poses_db)))
+        pose_w2c = np.linalg.inv(pose_c2w)
+        save_pose_details(query, pair_details, rotation_rows, medoid_name,
+                          query_c2w=pose_c2w, query_w2c=pose_w2c)
+        results.append((query, pose_w2c, medoid_name, len(poses_db)))
 
     if not results:
         raise RuntimeError('No InLoc queries could be localized.')
