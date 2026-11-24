@@ -85,6 +85,7 @@ def main():
                         action='store_false', help='关闭平移射线一致性筛选')
     parser.add_argument('--query_image', type=str, nargs='+', default=None,
                         help='只定位指定 query；可用 pairs 中的完整路径或文件名')
+    # 一般要开启--pose_details
     parser.add_argument('--pose_details', action='store_true',
                         help='在 output_dir/pose_details 保存逐 query 诊断日志')
     parser.add_argument('--amp', type=int, default=0, choices=[0, 1],

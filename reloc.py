@@ -276,6 +276,7 @@ def main():
                         action='store_false', help='disable translation-consensus filtering')
     parser.add_argument('--query_image', type=str, nargs='+', default=None,
                         help='localize only these query image names (as stored in COLMAP/H5)')
+    # 一般要开启--pose_details
     parser.add_argument('--pose_details', action='store_true',
                         help='save per-query relative poses and final pose under output_dir/pose_details')
     parser.add_argument('--amp', type=int, default=0, choices=[0, 1],
